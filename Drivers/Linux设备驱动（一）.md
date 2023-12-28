@@ -1,10 +1,5 @@
----
-# 2. 面向对象的驱动架构
----
 # 基本内嵌结构：kobject与kset
-  kobject作为Linux设备驱动框架的底层实现，本身并不具备特定的含义。要说的话他类似于Java中的Object类，是Linux设备驱动中所有结构体的"基类"。
-  当然C语言本身没有继承这回事，所以Linux内核是通过结构体内嵌以及`container_of`宏来达成类似的效果。`kobject`在架构上作为基类，实现上则是以
-  引用计数为核心，详细结构如下：
+&emsp;&emsp;kobject作为Linux设备驱动框架的底层实现，本身并不具备特定的含义。要说的话他类似于Java中的Object类，是Linux设备驱动中所有结构体的"基类"。当然C语言本身没有继承这回事，所以Linux内核是通过结构体内嵌以及`container_of`宏来达成类似的效果。`kobject`在架构上作为基类，实现上则是以引用计数为核心，详细结构如下：
 ```cpp
 struct kobject {
 	const char		*name;
@@ -24,13 +19,9 @@ struct kobject {
 	unsigned int uevent_suppress:1;
 };
 ```
-  从kobject的结构体就能了解到有关他的绝大部分内容，这个道理对于Linux驱动框架同样适用——Linux驱动模块的绝大部分功能都可以通过阅读头文件得到。
-  kobjet首先有着自己的名字，这个名字也对应着`sysfs`中目录项的名字。`parent`与`kset`则指示了kobject间的联系，parent指示的是树状关系的kobject，kset
-  则是集合关系的kobject(entry是kobject在kset中的节点)。`kref`是kobject的核心，用于管理引用计数。`ktype`则是指示kobject所拥有的一组操作，详见后文。
-  `sd`为kobject在sysfs中的文件节点。
+&emsp;&emsp;从kobject的结构体就能了解到有关他的绝大部分内容，这个道理对于Linux驱动框架同样适用——Linux驱动模块的绝大部分功能都可以通过阅读头文件得到。kobjet首先有着自己的名字，这个名字也对应着`sysfs`中目录项的名字。`parent`与`kset`则指示了kobject间的联系，parent指示的是树状关系的kobject，kset则是集合关系的kobject(entry是kobject在kset中的节点)。`kref`是kobject的核心，用于管理引用计数。`ktype`则是指示kobject所拥有的一组操作，详见后文。`sd`为kobject在sysfs中的文件节点。
 
-  `ktype`具体结构如下。在Linux内核的许多架构中，都体现了这种**数据与操作分离**的特征，设备驱动框架尤为明显。ktype中的操作我们现在主要关注两个，一
-  是`release`，当引用计数为0时，release会被调用。二是`sysfs_ops`，对于sysfs中文件的读写实现就是通过填充这个函数集指针实现。
+&emsp;&emsp;`ktype`具体结构如下。在Linux内核的许多架构中，都体现了这种**数据与操作分离**的特征，设备驱动框架尤为明显。ktype中的操作我们现在主要关注两个，一是`release`，当引用计数为0时，release会被调用。二是`sysfs_ops`，对于sysfs中文件的读写实现就是通过填充这个函数集指针实现。
 
 ```cpp
 struct kobj_type {
@@ -42,7 +33,7 @@ struct kobj_type {
 	void (*get_ownership)(struct kobject *kobj, kuid_t *uid, kgid_t *gid);
 };
 ```
-<br>  关于kobject的核心操作主要是下面五个。前三个是kobject的创建/销毁，后面两个则是kobject的引用计数操作。
+&emsp;&emsp;关于kobject的核心操作主要是下面五个。前三个是kobject的创建/销毁，后面两个则是kobject的引用计数操作。
 ```cpp
 extern void kobject_init(struct kobject *kobj, const struct kobj_type *ktype);
 extern int kobject_add(struct kobject *kobj, struct kobject *parent,
@@ -54,8 +45,8 @@ extern struct kobject *kobject_get(struct kobject *kobj);
 // 减少引用计数
 extern void kobject_put(struct kobject *kobj);
 ```
-  kobject_init会做一些检查，并初始化结构体和引用计数。从代码中也可以看到，初始化一个kobject'时，ktype必须不为空，否则这个kobject就是不能操作的
-  无效对象。
+&emsp;&emsp;kobject_init会做一些检查，并初始化结构体和引用计数。从代码中也可以看到，初始化一个kobject时，ktype必须不为空，否则这个kobject就是不能操作的无效对象。
+
 ```cpp
 void kobject_init(struct kobject *kobj, const struct kobj_type *ktype)
 {
