@@ -119,7 +119,7 @@ struct device {
 &emsp;&emsp;这个庞大的结构体可以分成三个部分看待，一是device的基本属性，如：
 
 + kobject： 内嵌的kobject，用于注册sysfs中的目录项，以及管理引用计数
-+ device_private：设备私有数据
++ device_private：设备私有数据，在Linux设备驱动架构里面，主要用于存储device所属的bus、class、driver的引用，以及该device的父亲、兄弟节点等。
 + type：设备关联的一些操作，其实就是对应于底层的ktype，和sysfs操作有关
 + id： 设备号
 
@@ -349,5 +349,251 @@ done:
 
 ## 2. driver
 
-&emsp;&emsp;device与driver的关系可以大致当作是数据与接口的关系，。
+&emsp;&emsp;device与driver的关系可以大致当作是数据与接口的关系。
 
+```cpp
+struct device_driver {
+	const char		*name;
+	struct bus_type		*bus;
+
+	struct module		*owner;
+	const char		*mod_name;	/* used for built-in modules */
+
+	bool suppress_bind_attrs;	/* disables bind/unbind via sysfs */
+	enum probe_type probe_type;
+
+	const struct of_device_id	*of_match_table;
+	const struct acpi_device_id	*acpi_match_table;
+
+	int (*probe) (struct device *dev);
+	void (*sync_state)(struct device *dev);
+	int (*remove) (struct device *dev);
+	void (*shutdown) (struct device *dev);
+	int (*suspend) (struct device *dev, pm_message_t state);
+	int (*resume) (struct device *dev);
+	const struct attribute_group **groups;
+	const struct attribute_group **dev_groups;
+
+	const struct dev_pm_ops *pm;
+	void (*coredump) (struct device *dev);
+
+	struct driver_private *p;
+};
+
+```
+
+&emsp;&emsp;driver的私有数据结构体如下：
+
+```cpp
+struct driver_private {
+	struct kobject kobj;
+	struct klist klist_devices;
+	struct klist_node knode_bus;
+	struct module_kobject *mkobj;
+	struct device_driver *driver;
+};
+```
+
+&emsp;&emsp;该结构体首先自带一个kobject，因此driver可以被显示在sysfs的某个目录下(/sys/bus/xxxx/drivers)。该私有结构记录了所有绑定的device同时，也作为节点被记录在对应的bus上，这样bus才能在添加device时，尝试匹配并绑定device和driver。
+
+&emsp;&emsp;一般来说，主要关注driver以下三个属性：
+
++ probe：device和driver绑定后会调用该函数，一般用于初始化设备信息。
++ remove：与probe相反，device与driver解绑后调用。对于不支持系统运行时bind\unbind的驱动而言，就并不是很有必要去实现了。
++ of_match_table：用于匹配DTS节点中compatible节点的属性，会被bus的match流程所使用。
+
+&emsp;&emsp;suspend, shutdown, resume主要用于runtime power manager，但是新的power设计是建议将runtime power manager与device power manager等电源管理都整合到了pm结构体中，所以建议不要使用上述三个接口，统一配置pm指针即可。pm也提供的方便的宏用于设置接口：
+
+```cpp
+// 用于设置rpm接口
+SET_RUNTIME_PM_OPS(suspend_fn, resume_fn, idle_fn)
+// 用于设置dpm接口
+SET_SYSTEM_SLEEP_PM_OPS(suspend_fn, resume_fn) 
+SET_LATE_SYSTEM_SLEEP_PM_OPS(suspend_fn, resume_fn)
+SET_NOIRQ_SYSTEM_SLEEP_PM_OPS(suspend_fn, resume_fn)
+```
+
+&emsp;&emsp;driver的主要函数有两个，主要关注前者，即register操作，unregister操作基本是register操作的相反操作：
+
+```cpp
+int __must_check driver_register(struct device_driver *drv);
+void driver_unregister(struct device_driver *drv);
+```
+
+&emsp;&emsp;代码如下：
+
+```cpp
+int driver_register(struct device_driver *drv)
+{
+	int ret;
+	struct device_driver *other;
+
+    // driver所属的bus必须先于driver初始化完成
+	if (!drv->bus->p) {
+		pr_err("Driver '%s' was unable to register with bus_type '%s' because the bus was not initialized.\n",
+			   drv->name, drv->bus->name);
+		return -EINVAL;
+	}
+
+    // 判断driver的操作是否合法
+	if ((drv->bus->probe && drv->probe) ||
+	    (drv->bus->remove && drv->remove) ||
+	    (drv->bus->shutdown && drv->shutdown))
+		pr_warn("Driver '%s' needs updating - please use "
+			"bus_type methods\n", drv->name);
+
+    // 判断是否重复注册driver
+	other = driver_find(drv->name, drv->bus);
+	if (other) {
+		pr_err("Error: Driver '%s' is already registered, "
+			"aborting...\n", drv->name);
+		return -EBUSY;
+	}
+
+    // 核心操作，往bus添加新的driver
+	ret = bus_add_driver(drv);
+	if (ret)
+		return ret;
+    // 在sysfs添加driver对应目录，实际上是添加的目录是driver_private中内嵌的kobject所对应的节点属性
+	ret = driver_add_groups(drv, drv->groups);
+	if (ret) {
+		bus_remove_driver(drv);
+		return ret;
+	}
+    // 通过uevent通知用户层相关信息
+	kobject_uevent(&drv->p->kobj, KOBJ_ADD);
+	deferred_probe_extend_timeout();
+
+	return ret;
+}
+
+int bus_add_driver(struct device_driver *drv)
+{
+	struct bus_type *bus;
+	struct driver_private *priv;
+	int error = 0;
+
+    // 添加bus的引用计数
+	bus = bus_get(drv->bus);
+	if (!bus)
+		return -EINVAL;
+
+	pr_debug("bus: '%s': add driver %s\n", bus->name, drv->name);
+
+    // 创建driver_private
+	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
+	if (!priv) {
+		error = -ENOMEM;
+		goto out_put_bus;
+	}
+    // 初始化kobject
+	klist_init(&priv->klist_devices, NULL, NULL);
+	priv->driver = drv;
+	drv->p = priv;
+	priv->kobj.kset = bus->p->drivers_kset;
+	error = kobject_init_and_add(&priv->kobj, &driver_ktype, NULL,
+				     "%s", drv->name);
+	if (error)
+		goto out_unregister;
+
+ 	// 将driver记录到bus的链表上，用于快速查找bus上所挂载的driver
+	klist_add_tail(&priv->knode_bus, &bus->p->klist_drivers);
+    
+    // !!!!!!!
+    // 尝试绑定driver与device
+	if (drv->bus->p->drivers_autoprobe) {
+		error = driver_attach(drv);
+		if (error)
+			goto out_del_list;
+	}
+	module_add_driver(drv->owner, drv);
+
+    // 创建driver的文件节点，位于/sys/bus/xxxx/drivers
+	error = driver_create_file(drv, &driver_attr_uevent);
+	if (error) {
+		printk(KERN_ERR "%s: uevent attr (%s) failed\n",
+			__func__, drv->name);
+	}
+	error = driver_add_groups(drv, bus->drv_groups);
+	if (error) {
+		/* How the hell do we get out of this pickle? Give up */
+		printk(KERN_ERR "%s: driver_add_groups(%s) failed\n",
+			__func__, drv->name);
+	}
+
+	if (!drv->suppress_bind_attrs) {
+        // 创建bind/unbind属性
+		error = add_bind_files(drv);
+		if (error) {
+			/* Ditto */
+			printk(KERN_ERR "%s: add_bind_files(%s) failed\n",
+				__func__, drv->name);
+		}
+	}
+
+	return 0;
+
+out_del_list:
+	klist_del(&priv->knode_bus);
+out_unregister:
+	kobject_put(&priv->kobj);
+	/* drv->p is freed in driver_release()  */
+	drv->p = NULL;
+out_put_bus:
+	bus_put(bus);
+	return error;
+}
+```
+
+&emsp;&emsp;driver的核心操作基本如此。到现在我们可以发现，当`device_register`或者`driver_register`调用时，其挂载的bus都会去尝试绑定driver和device，并进一步的去调用probe操作。这个概念是整个设备驱动框架的核心。
+
+&emsp;&emsp;driver的目录下面，通常都有bind和unbind属性，这是通过调用`add_bind_files`实现的，其对应的节点操作为：
+
+```cpp
+/* Manually detach a device from its associated driver. */
+static ssize_t unbind_store(struct device_driver *drv, const char *buf,
+			    size_t count)
+{
+	struct bus_type *bus = bus_get(drv->bus);
+	struct device *dev;
+	int err = -ENODEV;
+
+	dev = bus_find_device_by_name(bus, NULL, buf);
+	if (dev && dev->driver == drv) {
+		device_driver_detach(dev);
+		err = count;
+	}
+	put_device(dev);
+	bus_put(bus);
+	return err;
+}
+static DRIVER_ATTR_IGNORE_LOCKDEP(unbind, S_IWUSR, NULL, unbind_store);
+
+static ssize_t bind_store(struct device_driver *drv, const char *buf,
+			  size_t count)
+{
+	struct bus_type *bus = bus_get(drv->bus);
+	struct device *dev;
+	int err = -ENODEV;
+
+	dev = bus_find_device_by_name(bus, NULL, buf);
+	if (dev && dev->driver == NULL && driver_match_device(drv, dev)) {
+		err = device_driver_attach(drv, dev);
+
+		if (err > 0) {
+			/* success */
+			err = count;
+		} else if (err == 0) {
+			/* driver didn't accept device */
+			err = -ENODEV;
+		}
+	}
+	put_device(dev);
+	bus_put(bus);
+	return err;
+}
+static DRIVER_ATTR_IGNORE_LOCKDEP(bind, S_IWUSR, NULL, bind_store);
+
+```
+
+&emsp;&emsp;可以看见当对bind进行写操作时，会调用到`device_driver_attach()`，进而让bus尝试去绑定device和driver，对unbind的写操作是类似的。通过写driver的bind与unbind属性，可以实现在用户态手动控制设备驱动的bind/unbind行为，为此需要将driver结构体中的suppress_bind_attrs设置为false(默认就是false)。如果不想提供手动bind/unbind操作，则应该将suppress_bind_attrs设为true。
