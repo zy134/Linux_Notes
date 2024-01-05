@@ -1,4 +1,4 @@
-## 驱动架构核心：Device，Driver，Bus，Class
+## 设备驱动核心：device与driver
 
 &emsp;&emsp;整个设备驱动架构核心由Device，Driver，Bus，Class四个部分组成。这四个结构体都从kobject“继承”而来，因而其生命周期与引用计数是相关的，需要通过kobject的get/put操作来控制。四个结构体的大致分工如下：
 
@@ -7,11 +7,11 @@
 + bus：位于/sys/bus目录下。在linux驱动架构上，driver必须挂载在某个总线上，bus可以绑定device与driver，从而使能device。这个总线可以是物理意义上的总线(I2C, SPI)，也可以是虚拟总线(platform bus)。通过总线可以很好的将设备驱动分为不同的层次。此外相同的物理总线上，设备一般遵循相同的specific，就可以将相同的属性与操作提取出来，提升软件的复用程度。
 + class：位于/sys/class目录下。顾名思义，表示分类。这个分类很杂，一般来说取决于实现，可以是物理性质上的分类，譬如I2C，gpio，也可以是功能分类，像是video4linux。/sys/class下的目录项一般都是到/sys/devices各个目录的链接。
 
-## 1. device
+## 1.device
 
 #### (1) 概述
 
-&emsp;&emsp;`struct device`是表示设备属性的结构体，包含诸多底层信息。设备驱动的实现往往需要内嵌struct device。先看看其定义:
+&emsp;&emsp;`struct device`是表示设备属性的结构体，包含诸多底层信息。先看定义:
 
 ```c
 struct device {
@@ -118,7 +118,7 @@ struct device {
 
 &emsp;&emsp;这个庞大的结构体可以分成三个部分看待，一是device的基本属性，如：
 
-+ kobject： 内嵌的kobject，用于注册sysfs中的目录项，以及管理引用计数
++ kobject： 内嵌的kobject，用于注册sysfs中的文件项，以及管理引用计数
 + device_private：设备私有数据，在Linux设备驱动架构里面，主要用于存储device所属的bus、class、driver的引用，以及该device的父亲、兄弟节点等。
 + type：设备关联的一些操作，其实就是对应于底层的ktype，和sysfs操作有关
 + id： 设备号
@@ -225,7 +225,9 @@ int device_add(struct device *dev)
 	pr_debug("device: '%s': %s\n", dev_name(dev), __func__);
 
     // 获取device的父节点，同时增加其引用计数
+    // 拥有层次结构的device，会在调用device_register前设置就parent属性，使得注册的子设备可以挂载到父设备的目录下
     // 如果传入的device的父节点为空，即dev->parent未设置，那么就选择class或者bus上的某个根节点作为父节点
+    // 一般来说，device会注册到sysfs的/sys/devices/xxxx/目录下面，比如/sys/devices/platform,/sys/devices/virtual等
 	parent = get_device(dev->parent);
 	kobj = get_device_parent(dev, parent);
 	if (IS_ERR(kobj)) {
@@ -239,6 +241,7 @@ int device_add(struct device *dev)
 	if (parent && (dev_to_node(dev) == NUMA_NO_NODE))
 		set_dev_node(dev, dev_to_node(parent));
 
+    // 成功获取device的父亲节点后，创建device的文件节点，链接到父节点的目录下
 	/* first, register with generic layer. */
 	/* we require the name to be set before, and pass NULL */
 	error = kobject_add(&dev->kobj, dev->kobj.parent, NULL);
@@ -256,7 +259,7 @@ int device_add(struct device *dev)
 		goto attrError;
 
     // 在device对应目录下，创建of_node、susbsystem等节点
-    // of_node对应dts，susbsystem对应该device所属的class
+    // of_node对应dts，susbsystem对应该device所属的bus或者class
 	error = device_add_class_symlinks(dev);
 	if (error)
 		goto SymlinkError;
@@ -268,6 +271,7 @@ int device_add(struct device *dev)
 	error = bus_add_device(dev);
 	if (error)
 		goto BusError;
+    // PM相关操作，先跳过
 	error = dpm_sysfs_add(dev);
 	if (error)
 		goto DPMError;
@@ -288,7 +292,10 @@ int device_add(struct device *dev)
 	/* Notify clients of device addition.  This call must come
 	 * after dpm_sysfs_add() and before kobject_uevent().
 	 */
-	bus_notify(dev, BUS_NOTIFY_ADD_DEVICE);
+    // 通知bus，调用notifier上注册的回调函数老响应BUS_NOTIFY_ADD_DEVICE事件
+	if (dev->bus)
+		blocking_notifier_call_chain(&dev->bus->p->bus_notifier,
+					     BUS_NOTIFY_ADD_DEVICE, dev);
     // 通过netlink发送信息到用户态，通知device已经add完毕
 	kobject_uevent(&dev->kobj, KOBJ_ADD);
 
@@ -324,13 +331,16 @@ int device_add(struct device *dev)
 		klist_add_tail(&dev->p->knode_parent,
 			       &parent->p->klist_children);
 
+    // 如果赋予了device以class，则绑定device与class
 	sp = class_to_subsys(dev->class);
 	if (sp) {
 		mutex_lock(&sp->mutex);
 		/* tie the class to the device */
+        // 将device添加到class的链表上记录起来
 		klist_add_tail(&dev->p->knode_class, &sp->klist_devices);
 
 		/* notify any interfaces that the device is here */
+        // 调用class中的add_dev自定义函数
 		list_for_each_entry(class_intf, &sp->interfaces, node)
 			if (class_intf->add_dev)
 				class_intf->add_dev(dev);
@@ -597,3 +607,4 @@ static DRIVER_ATTR_IGNORE_LOCKDEP(bind, S_IWUSR, NULL, bind_store);
 ```
 
 &emsp;&emsp;可以看见当对bind进行写操作时，会调用到`device_driver_attach()`，进而让bus尝试去绑定device和driver，对unbind的写操作是类似的。通过写driver的bind与unbind属性，可以实现在用户态手动控制设备驱动的bind/unbind行为，为此需要将driver结构体中的suppress_bind_attrs设置为false(默认就是false)。如果不想提供手动bind/unbind操作，则应该将suppress_bind_attrs设为true。
+

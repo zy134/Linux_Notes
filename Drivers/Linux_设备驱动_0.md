@@ -1,4 +1,5 @@
-# 基本内嵌结构：kobject与kset
+## 基本内嵌结构：kobject与kset
+
 &emsp;&emsp;kobject作为Linux设备驱动框架的底层实现，本身并不具备特定的含义。要说的话他类似于Java中的Object类，是Linux设备驱动中所有结构体的"基类"。当然C语言本身没有继承这回事，所以Linux内核是通过结构体内嵌以及`container_of`宏来达成类似的效果。`kobject`在架构上作为基类，实现上则是以引用计数为核心，详细结构如下：
 ```cpp
 struct kobject {
@@ -21,7 +22,13 @@ struct kobject {
 ```
 &emsp;&emsp;从kobject的结构体就能了解到有关他的绝大部分内容，这个道理对于Linux驱动框架同样适用——Linux驱动模块的绝大部分功能都可以通过阅读头文件得到。kobjet首先有着自己的名字，这个名字也对应着`sysfs`中目录项的名字。`parent`与`kset`则指示了kobject间的联系，parent指示的是树状关系的kobject，kset则是集合关系的kobject(entry是kobject在kset中的节点)。`kref`是kobject的核心，用于管理引用计数。`ktype`则是指示kobject所拥有的一组操作，详见后文。`sd`为kobject在sysfs中的文件节点。
 
-&emsp;&emsp;`ktype`具体结构如下。在Linux内核的许多架构中，都体现了这种**数据与操作分离**的特征，设备驱动框架尤为明显。ktype中的操作我们现在主要关注两个，一是`release`，当引用计数为0时，release会被调用。二是`sysfs_ops`，对于sysfs中文件的读写实现就是通过填充这个函数集指针实现。
+&emsp;&emsp;按个人经验，总结kobject在设备驱动框架中的主要三个作用：
+
++ 作为引用计数，协助管理各个结构体的生命周期(create/destroy)
++ 作为基类，便于代码复用，以及在不同模块之间的信息传递。当struct内嵌kobject时，可以通过`container_of`宏以及kobject指针获取指向原结构体的指针。
++ 作为sysfs中的某个具体文件而存在
+
+&emsp;&emsp;`ktype`，顾名思义，kobject的类型信息，表示了针对kobject的一组操作，其具体结构如下。在Linux内核的许多架构中，都体现了这种**数据与操作分离**的特征，设备驱动框架尤为明显。ktype中的操作我们现在主要关注两个，一是`release`，当引用计数为0时，release会被调用。二是`sysfs_ops`，对于sysfs中文件的读写实现就是通过填充这个函数集指针实现。
 
 ```cpp
 struct kobj_type {
@@ -160,8 +167,7 @@ void kobject_del(struct kobject *kobj)
 	kobject_put(parent);
 }
 ```
-<br>   kset顾名思义，是一个集合，具体的说就是kobject的集合。kset本身也是一个kobject，所以它也是通过引用计数管理的。从kset的结构中可以看见，他维护
-  着一个kobject的链表，以及一个uevent_ops。uevent的作用是，当从kset中添加/删除kobject时，将该信息通知到userspace。
+&emsp;&emsp;kset是kobject的集合，通常表示sysfs中的一个目录项。kset本身也是一个kobject，所以它也是通过引用计数管理的。从kset的结构中可以看见，他维护着一个kobject的链表，以及一个uevent_ops。uevent的作用是，当从kset中添加/删除kobject时，将该信息通知到userspace。
 ```cpp
 struct kset {
 	struct list_head list;
