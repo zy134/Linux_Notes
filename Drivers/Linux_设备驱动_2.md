@@ -357,3 +357,420 @@ int bus_add_driver(struct device_driver *drv)
 
 ```
 
+### 3.匹配与绑定device和driver
+
+&emsp;&emsp;匹配与绑定是bus在设备驱动框架中所负责的主要工作，先说明两个函数：
+
+```cpp
+int driver_attach(struct device_driver *drv);
+void bus_probe_device(struct device *dev);
+```
+
+&emsp;&emsp;这两个函数都在driver/device注册时被自动调用，进而去匹配和绑定操作，先看`driver_attach`函数。该函数被`bus_add_driver`所调用，其对于每一个注册到bus上的device调用`__driver_attach`，尝试去绑定device和driver
+
+```cpp
+int driver_attach(struct device_driver *drv)
+{
+	return bus_for_each_dev(drv->bus, NULL, drv, __driver_attach);
+}
+```
+
+&emsp;&emsp;`__driver_attach`针对传入的device和driver，先尝试调用`driver_match_device`去匹配device和driver，匹配成功的情况下，调用`device_driver_attach`去进行绑定操作。匹配操作实际上是依赖于具体bus的，调用`bus_type`中的`match`方法。当match大于0时，匹配成功。
+
+&emsp;&emsp;匹配失败存在两种情况，当返回**EPROBE_DEFER**时，说明虽然现在driver和device不能完成匹配，但是在未来某个节点device也许可以找到和他匹配的driver，所以将它添加到一个名为**deferred_probe_pending_list**的链表中，等待后续时刻重新开始probe。另一种情况就是匹配失败，直接返回。
+
+```cpp
+static int __driver_attach(struct device *dev, void *data)
+{
+	struct device_driver *drv = data;
+	bool async = false;
+	int ret;
+
+	/*
+	 * Lock device and try to bind to it. We drop the error
+	 * here and always return 0, because we need to keep trying
+	 * to bind to devices and some drivers will return an error
+	 * simply if it didn't support the device.
+	 *
+	 * driver_probe_device() will spit a warning if there
+	 * is an error.
+	 */
+
+    // driver_match_device会去调用bus的match方法
+	ret = driver_match_device(drv, dev);
+	if (ret == 0) {
+		/* no match */
+		return 0;
+	} else if (ret == -EPROBE_DEFER) {
+		dev_dbg(dev, "Device match requests probe deferral\n");
+		driver_deferred_probe_add(dev);
+		/*
+		 * Driver could not match with device, but may match with
+		 * another device on the bus.
+		 */
+		return 0;
+	} else if (ret < 0) {
+		dev_dbg(dev, "Bus failed to match device: %d\n", ret);
+		return ret;
+	} /* ret > 0 means positive match */
+
+	if (driver_allows_async_probing(drv)) {
+		/*
+		 * Instead of probing the device synchronously we will
+		 * probe it asynchronously to allow for more parallelism.
+		 *
+		 * We only take the device lock here in order to guarantee
+		 * that the dev->driver and async_driver fields are protected
+		 */
+		dev_dbg(dev, "probing driver %s asynchronously\n", drv->name);
+		device_lock(dev);
+		if (!dev->driver) {
+			get_device(dev);
+			dev->p->async_driver = drv;
+			async = true;
+		}
+		device_unlock(dev);
+		if (async)
+			async_schedule_dev(__driver_attach_async_helper, dev);
+		return 0;
+	}
+
+	device_driver_attach(drv, dev);
+
+	return 0;
+}
+
+```
+
+&emsp;&emsp;匹配成功后，既可以直接调用`device_driver_attach`去同步的完成绑定device和driver的任务，也可以通过`async_schedule_dev`起一个异步任务去完成attach和probe，是否异步执行取决于驱动配置，当probe流程速度很慢会拖垮系统启动时，就应该配置成异步运行，类似mmc这样初始化较慢且与其他模块不存在过多依赖的外设，通常都使用异步的probe。通过将driver结构中的`probe_type`设置成**PROBE_PREFER_ASYNCHRONOUS**，就可以使驱动异步执行attach和probe。 
+
+&emsp;&emsp;对于一些模块而言，需要等待设备初始化完毕，或者希望设备状态保持原子化，那么就可以调用`wait_for_device_probe`函数，等待所有异步任务与defered任务的完成。
+
+```cpp
+
+// 同步调用driver_probe_driver
+int device_driver_attach(struct device_driver *drv, struct device *dev)
+{
+	int ret = 0;
+
+	__device_driver_lock(dev, dev->parent);
+
+	/*
+	 * If device has been removed or someone has already successfully
+	 * bound a driver before us just skip the driver probe call.
+	 */
+	if (!dev->p->dead && !dev->driver)
+		ret = driver_probe_device(drv, dev);
+
+	__device_driver_unlock(dev, dev->parent);
+
+	return ret;
+}
+
+// 异步调用driver_probe_driver
+static void __driver_attach_async_helper(void *_dev, async_cookie_t cookie)
+{
+	struct device *dev = _dev;
+	struct device_driver *drv;
+	int ret = 0;
+
+	__device_driver_lock(dev, dev->parent);
+
+	drv = dev->p->async_driver;
+
+	/*
+	 * If device has been removed or someone has already successfully
+	 * bound a driver before us just skip the driver probe call.
+	 */
+	if (!dev->p->dead && !dev->driver)
+		ret = driver_probe_device(drv, dev);
+
+	__device_driver_unlock(dev, dev->parent);
+
+	dev_dbg(dev, "driver %s async attach completed: %d\n", drv->name, ret);
+
+	put_device(dev);
+}
+
+```
+
+&emsp;&emsp;上述的asynchronous任务与defered任务是两个不同阶段的概念，首先defered任务指的是device和driver**匹配失败**，这也许是该device的依赖模块未完成初始化，因此并不简单的返回错误，而是将device添加到**deferred_probe_pending_list**中，等待后续某个时刻重新开始匹配device与driver。asynchrounous任务是在**匹配完成以后**，可以根据驱动配置同步的或者异步的去调用probe流程。
+
+&emsp;&emsp;不管probe是同步进行的还是异步进行的，都会去调用`driver_probe_device`函数，该函数完成绑定设备驱动的任务，此外注意该函数不持有锁，必须在加锁后调用：
+
+```cpp
+int driver_probe_device(struct device_driver *drv, struct device *dev)
+{
+	int ret = 0;
+
+	if (!device_is_registered(dev))
+		return -ENODEV;
+
+	pr_debug("bus: '%s': %s: matched device %s with driver %s\n",
+		 drv->bus->name, __func__, dev_name(dev), drv->name);
+
+    // 增加suppliers的pm计数
+	pm_runtime_get_suppliers(dev);
+    // 增加父节点的pm计数
+	if (dev->parent)
+		pm_runtime_get_sync(dev->parent);
+    // 当pm计数为0时，对应驱动的resume函数会被调用，给父设备与suppliers上电
+    // 不过在这里主要是为了防止probe过程中父设备或者suppliers的suspend被调用
+
+	pm_runtime_barrier(dev);
+    // really_probe，完成probe工作的函数体
+	if (initcall_debug)
+		ret = really_probe_debug(dev, drv);
+	else
+		ret = really_probe(dev, drv);
+	pm_request_idle(dev);
+
+	if (dev->parent)
+		pm_runtime_put(dev->parent);
+
+	pm_runtime_put_suppliers(dev);
+	return ret;
+}
+```
+
+&emsp;&emsp;really_probe比较长，这里主要注意几点，一是probe例程调用成功后，device和driver完成了绑定，device目录下面会新增有一个指向driver目录的链接，driver目录同理，会链接到绑定的device，这样可以通过sysfs快速检查probe是否成功。probe同样可以返回EPROBE_DEFER，来触发延迟初始化的流程。
+
+&emsp;&emsp;其二是，really_probe函数并不是直接调用driver的probe，而是先调用bus的probe。像platform bus这样的虚拟bus，其probe实现一般只是driver probe的封装。类似i2c这样物理bus，其probe例程则需要做额外的工作，再去调用driver的probe。
+
+```cpp
+static int really_probe(struct device *dev, struct device_driver *drv)
+{
+	int ret = -EPROBE_DEFER;
+	int local_trigger_count = atomic_read(&deferred_trigger_count);
+	bool test_remove = IS_ENABLED(CONFIG_DEBUG_TEST_DRIVER_REMOVE) &&
+			   !drv->suppress_bind_attrs;
+
+    // 通过调用device_block_probing，推迟所有probe，用于实现pm的休眠唤醒机制
+	if (defer_all_probes) {
+		/*
+		 * Value of defer_all_probes can be set only by
+		 * device_block_probing() which, in turn, will call
+		 * wait_for_device_probe() right after that to avoid any races.
+		 */
+		dev_dbg(dev, "Driver %s force probe deferral\n", drv->name);
+		driver_deferred_probe_add(dev);
+		return ret;
+	}
+
+	ret = device_links_check_suppliers(dev);
+    // device的依赖设备未准备好，添加到defered链表中，后续再重新开始调用bus_probe_device例程
+	if (ret == -EPROBE_DEFER)
+		driver_deferred_probe_add_trigger(dev, local_trigger_count);
+	if (ret)
+		return ret;
+
+	atomic_inc(&probe_count);
+	pr_debug("bus: '%s': %s: probing driver %s with device %s\n",
+		 drv->bus->name, __func__, drv->name, dev_name(dev));
+	if (!list_empty(&dev->devres_head)) {
+		dev_crit(dev, "Resources present before probing\n");
+		ret = -EBUSY;
+		goto done;
+	}
+
+re_probe:
+    // 链接device和driver结构
+	dev->driver = drv;
+
+	/* If using pinctrl, bind pins now before probing */
+	ret = pinctrl_bind_pins(dev);
+	if (ret)
+		goto pinctrl_bind_failed;
+
+	if (dev->bus->dma_configure) {
+		ret = dev->bus->dma_configure(dev);
+		if (ret)
+			goto probe_failed;
+	}
+
+    // 在driver的sysfs目录下面添加device的软链接
+	ret = driver_sysfs_add(dev);
+	if (ret) {
+		pr_err("%s: driver_sysfs_add(%s) failed\n",
+		       __func__, dev_name(dev));
+		goto probe_failed;
+	}
+
+	if (dev->pm_domain && dev->pm_domain->activate) {
+		ret = dev->pm_domain->activate(dev);
+		if (ret)
+			goto probe_failed;
+	}
+
+    // 调用probe，初始化device
+	if (dev->bus->probe) {
+		ret = dev->bus->probe(dev);
+		if (ret)
+			goto probe_failed;
+	} else if (drv->probe) {
+		ret = drv->probe(dev);
+		if (ret)
+			goto probe_failed;
+	}
+
+	ret = device_add_groups(dev, drv->dev_groups);
+	if (ret) {
+		dev_err(dev, "device_add_groups() failed\n");
+		goto dev_groups_failed;
+	}
+
+	if (dev_has_sync_state(dev)) {
+		ret = device_create_file(dev, &dev_attr_state_synced);
+		if (ret) {
+			dev_err(dev, "state_synced sysfs add failed\n");
+			goto dev_sysfs_state_synced_failed;
+		}
+	}
+
+	pinctrl_init_done(dev);
+
+	if (dev->pm_domain && dev->pm_domain->sync)
+		dev->pm_domain->sync(dev);
+
+    // 绑定完成
+	driver_bound(dev);
+	ret = 1;
+	pr_debug("bus: '%s': %s: bound device %s to driver %s\n",
+		 drv->bus->name, __func__, dev_name(dev), drv->name);
+	goto done;
+
+dev_sysfs_state_synced_failed:
+	device_remove_groups(dev, drv->dev_groups);
+dev_groups_failed:
+	if (dev->bus->remove)
+		dev->bus->remove(dev);
+	else if (drv->remove)
+		drv->remove(dev);
+probe_failed:
+	if (dev->bus)
+		blocking_notifier_call_chain(&dev->bus->p->bus_notifier,
+					     BUS_NOTIFY_DRIVER_NOT_BOUND, dev);
+pinctrl_bind_failed:
+	device_links_no_driver(dev);
+	devres_release_all(dev);
+	arch_teardown_dma_ops(dev);
+	kfree(dev->dma_range_map);
+	dev->dma_range_map = NULL;
+	driver_sysfs_remove(dev);
+	dev->driver = NULL;
+	dev_set_drvdata(dev, NULL);
+	if (dev->pm_domain && dev->pm_domain->dismiss)
+		dev->pm_domain->dismiss(dev);
+	pm_runtime_reinit(dev);
+	dev_pm_set_driver_flags(dev, 0);
+
+	switch (ret) {
+	case -EPROBE_DEFER:
+		/* Driver requested deferred probing */
+         // 一般来说是probe返回了EPROBE_DEFER，说明当前device有依赖未初始化完成
+		dev_dbg(dev, "Driver %s requests probe deferral\n", drv->name);
+		driver_deferred_probe_add_trigger(dev, local_trigger_count);
+		break;
+	case -ENODEV:
+	case -ENXIO:
+		pr_debug("%s: probe of %s rejects match %d\n",
+			 drv->name, dev_name(dev), ret);
+		break;
+	default:
+		/* driver matched but the probe failed */
+		pr_warn("%s: probe of %s failed with error %d\n",
+			drv->name, dev_name(dev), ret);
+	}
+	/*
+	 * Ignore errors returned by ->probe so that the next driver can try
+	 * its luck.
+	 */
+	ret = 0;
+done:
+	atomic_dec(&probe_count);
+	wake_up_all(&probe_waitqueue);
+	return ret;
+}
+
+```
+
+&emsp;&emsp;在probe完成后device和driver完成绑定，并调用driver_bound完成后续工作：
+
+```cpp
+static void driver_bound(struct device *dev)
+{
+	if (device_is_bound(dev)) {
+		pr_warn("%s: device %s already bound\n",
+			__func__, kobject_name(&dev->kobj));
+		return;
+	}
+
+	pr_debug("driver: '%s': %s: bound to device '%s'\n", dev->driver->name,
+		 __func__, dev_name(dev));
+
+	klist_add_tail(&dev->p->knode_driver, &dev->driver->p->klist_devices);
+    
+    // 更新devlink
+	device_links_driver_bound(dev);
+
+	device_pm_check_callbacks(dev);
+
+	/*
+	 * Make sure the device is no longer in one of the deferred lists and
+	 * kick off retrying all pending devices
+	 */
+	driver_deferred_probe_del(dev);
+	driver_deferred_probe_trigger();
+
+	if (dev->bus)
+		blocking_notifier_call_chain(&dev->bus->p->bus_notifier,
+					     BUS_NOTIFY_BOUND_DRIVER, dev);
+
+	kobject_uevent(&dev->kobj, KOBJ_BIND);
+}
+```
+
+&emsp;&emsp;该函数会重新触发defer probe。也就是说，每当一个设备驱动完成绑定，就会去触发defer probe，触发新的probe流程。如果还是返回EPROBE_DEFER，那就把对应device加回defer队列，等候下一次被触发，直到defer list为空，所有的工作都已经完成。绑定成功后还会发送**KOBJ_BIND**事件到用户层，应用可以监听netlink来查看驱动状态。后续讲uevent时会再细讲。
+
+&emsp;&emsp;再从device角度看待上述流程，因为基本是类似，只说明流程：
+
+```cpp
+void bus_probe_device(struct device *dev)
+{
+......
+	if (bus->p->drivers_autoprobe)
+		device_initial_probe(dev);
+}
+
+void device_initial_probe(struct device *dev)
+{
+	__device_attach(dev, true);
+}
+
+static int __device_attach(struct device *dev, bool allow_async)
+{
+// 同步调用，对于挂载在bus上的所有driver，尝试绑定device与driver
+		ret = bus_for_each_drv(dev->bus, NULL, &data,
+					__device_attach_driver);
+......
+// 异步调用
+	if (async)
+		async_schedule_dev(__device_attach_async_helper, dev);
+	return ret;
+}
+
+static int __device_attach_driver(struct device_driver *drv, void *_data)
+{
+...
+    // 匹配device与driver
+	ret = driver_match_device(drv, dev);
+
+    // 匹配成功后调用probe
+	return driver_probe_device(drv, dev);
+}
+
+
+```
+
+
+
